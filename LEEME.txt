@@ -1,0 +1,4 @@
+Espejo del BCV en GitHub Actions (reemplaza al Worker de Cloudflare)
+Estructura (respetar rutas y el punto de ".github"):
+  scripts/bcv-mirror.mjs
+  .github/workflows/bcv-mirror.yml

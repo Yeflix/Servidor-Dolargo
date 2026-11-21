@@ -1,0 +1,26 @@
+name: bcv-mirror
+
+on:
+  schedule:
+    - cron: "*/20 * * * *"   # cada ~20 min (GitHub puede retrasarlo unos minutos)
+  workflow_dispatch:          # botón "Run workflow" para probar a mano
+
+concurrency:
+  group: bcv-mirror
+  cancel-in-progress: false
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Scrapear BCV y publicar en Firestore
+        run: node scripts/bcv-mirror.mjs
+        env:
+          FIREBASE_SERVICE_ACCOUNT_JSON: ${{ secrets.FIREBASE_SERVICE_ACCOUNT_JSON }}
+          FIREBASE_PROJECT_ID: ${{ vars.FIREBASE_PROJECT_ID }}
+          BCV_PIN_SHA256: ${{ vars.BCV_PIN_SHA256 }}
