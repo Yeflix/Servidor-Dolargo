@@ -3,14 +3,20 @@
 //
 //  Por qué existe: el BCV no envía el certificado intermedio de Sectigo.
 //  Cloudflare Workers no puede completar la cadena (→ error 526) y no
-//  permite saltarse la validación. Node sí, y aquí se hace de forma segura:
-//  se acepta el certificado SOLO si su huella SHA-256 está en BCV_PIN_SHA256
-//  (la misma huella que fija la app en api_services.dart) y está vigente.
+//  permite saltarse la validación. Node sí. Se mira la huella SHA-256 del
+//  certificado (BCV_PIN_SHA256; las mismas que fija la app): si coincide, la
+//  conexión queda «verificada»; si no, se acepta igual y se deja un aviso
+//  (modo tolerante, para que una renovación no pare el espejo). Con
+//  BCV_STRICT=1 una huella no fijada se rechaza.
 //
 //  Escribe en Firestore:
 //    bcv_mirror/latest → { dolar, euro, updatedAt, source, scrapedBy }
-//    bcv_mirror/status → { lastAttemptAt, ok, error }   (diagnóstico)
-//  La app solo lee `latest`; `status` no la afecta.
+//    bcv_mirror/status → { lastAttemptAt, ok, error, pinned, certFingerprint,
+//                          historyDay, historyResult }   (diagnóstico)
+//    tasas_historico/YYYY-MM-DD (día de Caracas) → lo CREA si todavía no
+//      existe («el primero que llega gana»; nunca pisa uno existente). Usa la
+//      tasa del BCV y, si el BCV falla, la última del espejo.
+//  La app solo lee `latest` e historial; `status` no la afecta.
 //
 //  Variables de entorno:
 //    FIREBASE_SERVICE_ACCOUNT_JSON  (secret, obligatorio)
@@ -74,21 +80,28 @@ export function firstNonPercentNumber(text) {
   return null;
 }
 
-// ── Descarga del BCV con pin de certificado ───────────────────────────────
-function fetchBcvHtml(urlStr, pins) {
+// ── Descarga del BCV ──────────────────────────────────────────────────────
+// La cadena TLS del BCV llega incompleta, así que la validación normal falla
+// siempre. Se mira la huella del certificado:
+//   • huella fijada y vigente → «verificada» (pinned = true);
+//   • otra huella → se acepta igual y se avisa (modo tolerante, el de por
+//     defecto), para que una renovación del certificado no pare el espejo;
+//   • con BCV_STRICT=1 → una huella no fijada se rechaza.
+export function fetchBcvHtml(urlStr, pins, strict = false) {
   return new Promise((resolve, reject) => {
     const u = new URL(urlStr);
-    let pinOk = false;
+    let tlsChecked = false;
+    let pinned = false;
+    let fingerprint = "";
     const req = https.request(
       {
         host: u.hostname,
-        port: 443,
+        port: u.port || 443,
         path: u.pathname + u.search,
         method: "GET",
         servername: u.hostname,
         agent: false,
         timeout: 25_000,
-        // La cadena llega incompleta: la validación la hace el pin de abajo.
         rejectUnauthorized: false,
         headers: {
           "User-Agent":
@@ -99,31 +112,42 @@ function fetchBcvHtml(urlStr, pins) {
         },
       },
       (res) => {
-        if (!pinOk) { res.resume(); return reject(new Error("pin no verificado")); }
+        if (!tlsChecked) { res.resume(); return reject(new Error("TLS no comprobado")); }
         if (res.statusCode !== 200) {
           res.resume();
           return reject(new Error(`BCV HTTP ${res.statusCode}`));
         }
         const chunks = [];
         res.on("data", (c) => chunks.push(c));
-        res.on("end", () => resolve(Buffer.concat(chunks).toString("utf8")));
+        res.on("end", () =>
+          resolve({ html: Buffer.concat(chunks).toString("utf8"), pinned, fingerprint })
+        );
         res.on("error", reject);
       }
     );
     req.on("socket", (socket) => {
       socket.once("secureConnect", () => {
         const cert = socket.getPeerCertificate();
-        const fp = crypto.createHash("sha256").update(cert.raw).digest("hex").toUpperCase();
+        if (!cert || !cert.raw) {
+          req.destroy(new Error("El BCV no presentó certificado"));
+          return;
+        }
+        fingerprint = crypto.createHash("sha256").update(cert.raw).digest("hex").toUpperCase();
         const now = Date.now();
         const valid = now >= Date.parse(cert.valid_from) && now <= Date.parse(cert.valid_to);
-        if (valid && pins.includes(fp)) {
-          pinOk = true;
-        } else {
+        pinned = valid && pins.includes(fingerprint);
+        if (pinned) { tlsChecked = true; return; }
+        if (strict) {
           req.destroy(new Error(
-            `Certificado del BCV no fijado (huella ${fp}, vigente=${valid}, vence ${cert.valid_to}). ` +
-            `Verifícala desde una red de confianza y agrégala a BCV_PIN_SHA256.`
+            `Certificado del BCV no fijado (huella ${fingerprint}, vigente=${valid}, vence ${cert.valid_to}).`
           ));
+          return;
         }
+        console.warn(
+          `⚠️ Certificado del BCV sin huella fijada (huella ${fingerprint}, vigente=${valid}, ` +
+          `vence ${cert.valid_to}). Se acepta en modo tolerante. Para fijarla, agrégala a BCV_PIN_SHA256.`
+        );
+        tlsChecked = true;
       });
     });
     req.on("timeout", () => req.destroy(new Error("BCV timeout")));
@@ -158,17 +182,73 @@ async function getAccessToken(saJson) {
   return (await res.json()).access_token;
 }
 
+const FIRESTORE = (projectId) =>
+  `https://firestore.googleapis.com/v1/projects/${projectId}/databases/(default)/documents`;
+
+/** Valor de Firestore REST. `null` → nullValue. */
+const encValue = (v) =>
+  v === null ? { nullValue: null } :
+  typeof v === "number" ? { doubleValue: v } :
+  typeof v === "boolean" ? { booleanValue: v } : { stringValue: String(v) };
+
+const decNumber = (f) => {
+  if (!f) return null;
+  const v = "doubleValue" in f ? Number(f.doubleValue)
+    : "integerValue" in f ? Number(f.integerValue) : null;
+  return isSane(v) ? v : null;
+};
+
+/** "YYYY-MM-DD" del día en Caracas (UTC-4, sin horario de verano). */
+export function caracasDayKey(now = new Date()) {
+  return new Date(now.getTime() - 4 * 3600_000).toISOString().slice(0, 10);
+}
+
+/** Documento del historial con el mismo formato que guarda la app. */
+export function historyFields(dayKey, dolar, euro, source, savedAt) {
+  return {
+    date: `${dayKey}T12:00:00.000`,
+    dayKey,
+    dolarPrice: dolar,
+    euroPrice: euro,
+    usdtPrice: null,
+    source,
+    savedAt,
+  };
+}
+
+async function getDoc(projectId, token, docPath) {
+  const res = await fetch(`${FIRESTORE(projectId)}/${docPath}`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  if (res.status === 404) return null;
+  if (!res.ok) throw new Error(`firestore GET ${docPath} ${res.status}: ${await res.text()}`);
+  return (await res.json()).fields ?? null;
+}
+
+/**
+ * Crea `collection/docId` SOLO si no existe (POST con documentId: Firestore
+ * responde 409 ALREADY_EXISTS si ya está). Devuelve "created" o "exists".
+ */
+async function createDocIfMissing(projectId, token, collection, docId, fields) {
+  const url = `${FIRESTORE(projectId)}/${collection}?documentId=${encodeURIComponent(docId)}`;
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+    body: JSON.stringify({ fields: Object.fromEntries(Object.entries(fields).map(([k, v]) => [k, encValue(v)])) }),
+  });
+  if (res.status === 409) return "exists";
+  if (!res.ok) throw new Error(`firestore CREATE ${collection}/${docId} ${res.status}: ${await res.text()}`);
+  return "created";
+}
+
 async function patchDoc(projectId, token, docPath, fields) {
   // updateMask: solo se tocan los campos enviados (el resto se conserva).
   const mask = Object.keys(fields).map((k) => `updateMask.fieldPaths=${encodeURIComponent(k)}`).join("&");
-  const url = `https://firestore.googleapis.com/v1/projects/${projectId}/databases/(default)/documents/${docPath}?${mask}`;
-  const enc = (v) =>
-    typeof v === "number" ? { doubleValue: v } :
-    typeof v === "boolean" ? { booleanValue: v } : { stringValue: String(v) };
+  const url = `${FIRESTORE(projectId)}/${docPath}?${mask}`;
   const res = await fetch(url, {
     method: "PATCH",
     headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
-    body: JSON.stringify({ fields: Object.fromEntries(Object.entries(fields).map(([k, v]) => [k, enc(v)])) }),
+    body: JSON.stringify({ fields: Object.fromEntries(Object.entries(fields).map(([k, v]) => [k, encValue(v)])) }),
   });
   if (!res.ok) throw new Error(`firestore PATCH ${docPath} ${res.status}: ${await res.text()}`);
 }
@@ -181,9 +261,13 @@ async function main() {
   const pins = (process.env.BCV_PIN_SHA256 || DEFAULT_PIN)
     .split(",").map((s) => s.replace(/[:\s]/g, "").toUpperCase()).filter(Boolean);
 
-  let dolar = null, euro = null, error = null;
+  const strict = process.env.BCV_STRICT === "1";
+  let dolar = null, euro = null, error = null, pinned = false, fingerprint = "";
   try {
-    const html = await fetchBcvHtml(process.env.BCV_URL || "https://www.bcv.org.ve/", pins);
+    const res = await fetchBcvHtml(process.env.BCV_URL || "https://www.bcv.org.ve/", pins, strict);
+    const html = res.html;
+    pinned = res.pinned;
+    fingerprint = res.fingerprint;
     dolar = extractBcvRate(html, "dolar");
     euro = extractBcvRate(html, "euro");
     if (dolar === null) error = "no se pudo extraer dolar del HTML";
@@ -191,10 +275,23 @@ async function main() {
   } catch (e) {
     error = e.message;
   }
-  console.log(JSON.stringify({ dolar, euro, error }));
+  console.log(JSON.stringify({ dolar, euro, pinned, error }));
 
   const token = await getAccessToken(saJson);
   const now = new Date().toISOString();
+
+  // Si el BCV no trajo las dos tasas, se lee el espejo ANTES de actualizarlo:
+  // es lo que se guardará en el historial para la moneda que faltó.
+  let mirrorDolar = null, mirrorEuro = null;
+  if (dolar === null || euro === null) {
+    try {
+      const latest = await getDoc(projectId, token, "bcv_mirror/latest");
+      mirrorDolar = decNumber(latest?.dolar);
+      mirrorEuro = decNumber(latest?.euro);
+    } catch (e) {
+      console.warn(`⚠️ No se pudo leer el espejo: ${e.message}`);
+    }
+  }
 
   if (dolar !== null || euro !== null) {
     const fields = { updatedAt: now, source: "bcv.org.ve", scrapedBy: "github-actions-v1" };
@@ -202,11 +299,40 @@ async function main() {
     if (euro !== null) fields.euro = euro;
     await patchDoc(projectId, token, "bcv_mirror/latest", fields);
   }
+
+  // Historial: el documento del día de Caracas, solo si no existe. Con el
+  // BCV caído se usa el precio del espejo (a pedido): así el historial no
+  // queda con huecos aunque nadie abra la app de admin ese día.
+  const dayKey = caracasDayKey();
+  const hDolar = dolar ?? mirrorDolar;
+  const hEuro = euro ?? mirrorEuro;
+  let historyResult;
+  if (hDolar === null || hEuro === null) {
+    historyResult = "sin datos";
+  } else {
+    const source = dolar !== null && euro !== null ? "github-actions" : "github-actions-espejo";
+    try {
+      historyResult = await createDocIfMissing(
+        projectId, token, "tasas_historico", dayKey,
+        historyFields(dayKey, hDolar, hEuro, source, now),
+      );
+      if (historyResult === "created") historyResult += ` (${source})`;
+    } catch (e) {
+      historyResult = `error: ${e.message}`.slice(0, 300);
+      console.warn(`⚠️ Historial: ${historyResult}`);
+    }
+  }
+  console.log(`Historial ${dayKey}: ${historyResult}`);
+
   // Latido de diagnóstico: distingue "worker muerto" de "BCV sin cambios".
   await patchDoc(projectId, token, "bcv_mirror/status", {
     lastAttemptAt: now,
     ok: dolar !== null && euro !== null,
     error: error ? error.slice(0, 300) : "",
+    pinned,                       // true = huella verificada; false = modo tolerante
+    certFingerprint: fingerprint, // huella que presentó el BCV (dato público)
+    historyDay: dayKey,
+    historyResult,
   });
 
   // Rojo en Actions (y correo de GitHub) si no se obtuvo nada.
