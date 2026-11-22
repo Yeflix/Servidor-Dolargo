@@ -1,0 +1,45 @@
+name: keepalive
+
+# GitHub apaga los workflows programados de un repo público tras 60 días sin
+# actividad. Este workflow corre el día 1 y el 15 de cada mes:
+#   1) si el último commit tiene más de 40 días, hace un commit mínimo
+#      (.github/keepalive: solo una fecha) para que el repo tenga actividad;
+#   2) por si acaso, vuelve a habilitar bcv-mirror.yml (no hace nada si ya
+#      está habilitado).
+# No toca nada más del repositorio ni usa secretos propios: solo el token
+# automático de Actions con los permisos de abajo.
+
+on:
+  schedule:
+    - cron: "17 13 1,15 * *"   # 1 y 15 de cada mes, 9:17 a. m. de Caracas
+  workflow_dispatch:
+
+permissions:
+  contents: write   # para el commit de actividad
+  actions: write    # para volver a habilitar bcv-mirror.yml
+
+jobs:
+  keepalive:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Commit de actividad si hace falta
+        run: |
+          last=$(git log -1 --format=%ct)
+          age_days=$(( ( $(date +%s) - last ) / 86400 ))
+          echo "Último commit hace ${age_days} días"
+          if [ "$age_days" -ge 40 ]; then
+            date -u +"%Y-%m-%dT%H:%M:%SZ" > .github/keepalive
+            git config user.name  "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add .github/keepalive
+            git commit -m "keepalive: actividad para no perder el cron"
+            git push
+          fi
+
+      - name: Asegurar que bcv-mirror sigue habilitado
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow enable bcv-mirror.yml --repo "$GITHUB_REPOSITORY" || true

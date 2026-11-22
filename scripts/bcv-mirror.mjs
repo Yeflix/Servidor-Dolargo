@@ -10,9 +10,16 @@
 //  BCV_STRICT=1 una huella no fijada se rechaza.
 //
 //  Escribe en Firestore:
-//    bcv_mirror/latest → { dolar, euro, updatedAt, source, scrapedBy }
+//    bcv_mirror/latest → { dolar, euro, updatedAt, source, scrapedBy,
+//                          dolarChangedAt, euroChangedAt }
+//      *ChangedAt = desde cuándo la tasa tiene ese valor (solo cambia cuando
+//      cambia el valor; updatedAt es un latido). La app marca «dato viejo»
+//      cuando el dólar lleva más de 4 días sin cambiar.
 //    bcv_mirror/status → { lastAttemptAt, ok, error, pinned, certFingerprint,
-//                          historyDay, historyResult }   (diagnóstico)
+//                          historyDay, historyResult, dayKey, okToday }
+//    bcv_mirror/stats-YYYY-MM-DD (día de Caracas) → { dayKey, runs, ok,
+//      firstOkAt, lastOkAt, meetsTarget }  contador de corridas del día
+//      (meta: ≥ 5 lecturas buenas). Solo informativo.
 //    tasas_historico/YYYY-MM-DD (día de Caracas) → lo CREA si todavía no
 //      existe («el primero que llega gana»; nunca pisa uno existente). Usa la
 //      tasa del BCV y, si el BCV falla, la última del espejo.
@@ -216,6 +223,65 @@ export function historyFields(dayKey, dolar, euro, source, savedAt) {
   };
 }
 
+/** Meta diaria de lecturas buenas del BCV (§14.1). */
+export const DAILY_TARGET = 5;
+
+/** Contador del día: suma una corrida (y una buena si `ok`). Función pura. */
+export function nextStats(prev, dayKey, ok, nowIso) {
+  const runs = (prev?.runs ?? 0) + 1;
+  const okCount = (prev?.ok ?? 0) + (ok ? 1 : 0);
+  return {
+    dayKey,
+    runs,
+    ok: okCount,
+    firstOkAt: prev?.firstOkAt || (ok ? nowIso : ""),
+    lastOkAt: ok ? nowIso : (prev?.lastOkAt || ""),
+    meetsTarget: okCount >= DAILY_TARGET,
+  };
+}
+
+/**
+ * Desde cuándo vale `value` una tasa. Si el valor no cambió se conserva la
+ * marca anterior; si cambió (o no había), es `nowIso`. `fallback` permite
+ * sembrar la primera marca desde el historial.
+ */
+export function nextChangedAt(prevValue, prevChangedAt, value, nowIso, fallback = null) {
+  if (value === null) return prevChangedAt || null;
+  if (prevValue !== null && Math.abs(prevValue - value) < 1e-9 && prevChangedAt) return prevChangedAt;
+  if (prevValue === null || Math.abs(prevValue - value) < 1e-9) return fallback || nowIso;
+  return nowIso;
+}
+
+/**
+ * Primera vez (sin dolarChangedAt): mira los últimos días del historial y
+ * devuelve el inicio (00:00 de Caracas, en ISO UTC) del primer día seguido
+ * con el mismo `value`. `days` = [{dayKey, value}] del más nuevo al más viejo.
+ */
+export function changedSinceFromHistory(days, value) {
+  let since = null;
+  for (const d of days) {
+    if (d.value === null || Math.abs(d.value - value) >= 1e-9) break;
+    since = d.dayKey;
+  }
+  return since ? `${since}T04:00:00.000Z` : null;
+}
+
+const decString = (f) => (f && "stringValue" in f ? f.stringValue : null);
+const decInt = (f) => {
+  if (!f) return null;
+  const v = "integerValue" in f ? Number(f.integerValue) : "doubleValue" in f ? Number(f.doubleValue) : null;
+  return Number.isFinite(v) ? v : null;
+};
+
+/** Últimos `n` días del historial (más nuevo primero) para una moneda. */
+async function recentHistory(projectId, token, field, n = 10) {
+  const url = `${FIRESTORE(projectId)}/tasas_historico?pageSize=${n}&orderBy=__name__%20desc`;
+  const res = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
+  if (!res.ok) throw new Error(`firestore LIST tasas_historico ${res.status}`);
+  const docs = (await res.json()).documents ?? [];
+  return docs.map((d) => ({ dayKey: d.name.split("/").pop(), value: decNumber(d.fields?.[field]) }));
+}
+
 async function getDoc(projectId, token, docPath) {
   const res = await fetch(`${FIRESTORE(projectId)}/${docPath}`, {
     headers: { Authorization: `Bearer ${token}` },
@@ -280,23 +346,40 @@ async function main() {
   const token = await getAccessToken(saJson);
   const now = new Date().toISOString();
 
-  // Si el BCV no trajo las dos tasas, se lee el espejo ANTES de actualizarlo:
-  // es lo que se guardará en el historial para la moneda que faltó.
-  let mirrorDolar = null, mirrorEuro = null;
-  if (dolar === null || euro === null) {
-    try {
-      const latest = await getDoc(projectId, token, "bcv_mirror/latest");
-      mirrorDolar = decNumber(latest?.dolar);
-      mirrorEuro = decNumber(latest?.euro);
-    } catch (e) {
-      console.warn(`⚠️ No se pudo leer el espejo: ${e.message}`);
-    }
+  // Se lee el espejo ANTES de actualizarlo: sirve para el historial (moneda
+  // que faltó) y para saber si la tasa cambió (dolarChangedAt/euroChangedAt).
+  let latest = null, latestOk = false;
+  try {
+    latest = await getDoc(projectId, token, "bcv_mirror/latest");
+    latestOk = true;
+  } catch (e) {
+    console.warn(`⚠️ No se pudo leer el espejo: ${e.message}`);
   }
+  const mirrorDolar = decNumber(latest?.dolar);
+  const mirrorEuro = decNumber(latest?.euro);
 
   if (dolar !== null || euro !== null) {
     const fields = { updatedAt: now, source: "bcv.org.ve", scrapedBy: "github-actions-v1" };
     if (dolar !== null) fields.dolar = dolar;
     if (euro !== null) fields.euro = euro;
+    // Solo con el espejo leído: si falló la lectura no se puede saber si
+    // cambió, y es mejor no tocar la marca que reiniciarla.
+    if (latestOk) {
+      for (const [cur, field, prevVal] of [["dolar", "dolarPrice", mirrorDolar], ["euro", "euroPrice", mirrorEuro]]) {
+        const value = cur === "dolar" ? dolar : euro;
+        if (value === null) continue;
+        const prevAt = decString(latest?.[`${cur}ChangedAt`]);
+        let seed = null;
+        if (!prevAt) {
+          try {
+            seed = changedSinceFromHistory(await recentHistory(projectId, token, field), value);
+          } catch (e) {
+            console.warn(`⚠️ Historial para ${cur}ChangedAt: ${e.message}`);
+          }
+        }
+        fields[`${cur}ChangedAt`] = nextChangedAt(prevVal, prevAt, value, now, seed);
+      }
+    }
     await patchDoc(projectId, token, "bcv_mirror/latest", fields);
   }
 
@@ -324,6 +407,21 @@ async function main() {
   }
   console.log(`Historial ${dayKey}: ${historyResult}`);
 
+  // Contador del día (§14.1): una corrida más; «buena» = el BCV dio las dos.
+  const readOk = dolar !== null && euro !== null;
+  let stats = null;
+  try {
+    const prev = await getDoc(projectId, token, `bcv_mirror/stats-${dayKey}`);
+    stats = nextStats(prev ? {
+      runs: decInt(prev.runs), ok: decInt(prev.ok),
+      firstOkAt: decString(prev.firstOkAt), lastOkAt: decString(prev.lastOkAt),
+    } : null, dayKey, readOk, now);
+    await patchDoc(projectId, token, `bcv_mirror/stats-${dayKey}`, stats);
+    console.log(`Hoy (${dayKey}): ${stats.ok}/${DAILY_TARGET} lecturas buenas en ${stats.runs} corridas`);
+  } catch (e) {
+    console.warn(`⚠️ Contador del día: ${e.message}`);
+  }
+
   // Latido de diagnóstico: distingue "worker muerto" de "BCV sin cambios".
   await patchDoc(projectId, token, "bcv_mirror/status", {
     lastAttemptAt: now,
@@ -333,6 +431,8 @@ async function main() {
     certFingerprint: fingerprint, // huella que presentó el BCV (dato público)
     historyDay: dayKey,
     historyResult,
+    dayKey,
+    okToday: stats ? stats.ok : -1,
   });
 
   // Rojo en Actions (y correo de GitHub) si no se obtuvo nada.
